@@ -1,0 +1,139 @@
+name: bwrap-capability-probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Probe namespaces, mounts, and network (no installs)
+        shell: bash
+        run: |
+          set -u
+          fail=0
+          pass() { echo "PASS: $*"; }
+          bad() { echo "FAIL: $*"; fail=1; }
+
+          echo "=== HOST ==="
+          uname -a
+          uname -m
+          nproc
+          free -h
+          df -h /
+          df -B1 / | tail -1
+          cat /etc/os-release
+          echo "kernel.apparmor_restrict_unprivileged_userns=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo unavailable)"
+
+          echo "=== TOOLS ==="
+          for c in bwrap unshare readlink timeout curl bash sh; do
+            if command -v "$c" >/dev/null 2>&1; then
+              echo "$c=$(command -v "$c")"
+            else
+              echo "$c=ABSENT"
+              case "$c" in bwrap|unshare|readlink|timeout|bash|sh) bad "required tool missing: $c" ;; esac
+            fi
+          done
+
+          if command -v bwrap >/dev/null 2>&1; then
+            bwrap --version || bad "bwrap --version failed"
+          else
+            echo "BWRAP_MISSING: no package installation attempted"
+          fi
+
+          echo "=== HOST NETWORK ==="
+          if command -v curl >/dev/null 2>&1 && timeout 5 curl -sS -I https://example.com >/dev/null 2>&1; then
+            echo "HOST_NETWORK=reachable"
+          else
+            echo "HOST_NETWORK=unreachable-or-curl-failed"
+          fi
+
+          echo "=== HOST NAMESPACE IDS ==="
+          for ns in mnt pid user ipc uts net; do
+            printf 'host_%s=%s\n' "$ns" "$(readlink "/proc/self/ns/$ns" 2>/dev/null || echo unavailable)"
+          done
+
+          echo "=== UNPRIVILEGED NAMESPACE TESTS ==="
+          ns_test() {
+            local name="$1"; shift
+            local out
+            out="$(mktemp)"
+            if "$@" >"$out" 2>&1; then
+              pass "$name"
+            else
+              bad "$name"
+              sed -n '1,4p' "$out"
+            fi
+            rm -f "$out"
+          }
+          ns_test "user namespace" unshare --user true
+          ns_test "user+mount namespace" unshare --user --map-root-user --mount true
+          ns_test "user+pid namespace" unshare --user --map-root-user --pid --fork true
+          ns_test "user+ipc namespace" unshare --user --map-root-user --ipc true
+          ns_test "user+uts namespace" unshare --user --map-root-user --uts true
+          ns_test "user+net namespace" unshare --user --map-root-user --net true
+
+          echo "=== BWRAP MOUNT/NETWORK PROBE ==="
+          if command -v bwrap >/dev/null 2>&1; then
+            WORK="$(mktemp -d)"
+            SCRATCH="$(mktemp -d)"
+            HOST_MARKER="$WORK/host-marker"
+            echo marker > "$HOST_MARKER"
+
+            BWRAP_OUT="$WORK/bwrap.out"
+            BWRAP_ERR="$WORK/bwrap.err"
+
+            if bwrap --unshare-all --die-with-parent --new-session \
+              --ro-bind /usr /usr \
+              --symlink usr/bin /bin \
+              --symlink usr/lib /lib \
+              --symlink usr/lib64 /lib64 \
+              --ro-bind /etc/ld.so.cache /etc/ld.so.cache \
+              --proc /proc --dev /dev \
+              --tmpfs /tmp \
+              --bind "$SCRATCH" "$SCRATCH" \
+              --chdir "$SCRATCH" \
+              /usr/bin/env -i \
+                HOST_MARKER="$HOST_MARKER" \
+                GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+                SCRATCH="$SCRATCH" \
+                /bin/sh -c '
+                  set -e
+                  test ! -e "$HOST_MARKER"
+                  echo scratch-ok > "$SCRATCH/probe"
+                  if touch /usr/bwrap-probe 2>/dev/null; then exit 22; fi
+                  test ! -e "$GITHUB_WORKSPACE"
+                  echo "sandbox_mnt=$(readlink /proc/self/ns/mnt)"
+                  echo "sandbox_pid=$(readlink /proc/self/ns/pid)"
+                  echo "sandbox_user=$(readlink /proc/self/ns/user)"
+                  echo "sandbox_ipc=$(readlink /proc/self/ns/ipc)"
+                  echo "sandbox_uts=$(readlink /proc/self/ns/uts)"
+                  echo "sandbox_net=$(readlink /proc/self/ns/net)"
+                  if /usr/bin/timeout 3 /bin/bash -c "exec 3<>/dev/tcp/1.1.1.1/443" 2>/dev/null; then exit 24; fi
+                  echo "sandbox_network_blocked=yes"
+                ' >"$BWRAP_OUT" 2>"$BWRAP_ERR"; then
+              pass "bwrap read-only mount, writable scratch, source invisibility, and network isolation"
+              cat "$BWRAP_OUT"
+            else
+              bad "bwrap sandbox probe"
+              sed -n '1,8p' "$BWRAP_ERR"
+            fi
+
+            if [ -f "$SCRATCH/probe" ]; then
+              pass "scratch write visible to host"
+            else
+              bad "scratch write missing"
+            fi
+
+            rm -rf "$WORK" "$SCRATCH"
+          else
+            echo "BWRAP_PROBE=SKIPPED (bwrap missing)"
+          fi
+
+          echo "=== RESULT ==="
+          if [ "$fail" -ne 0 ]; then
+            echo "PROBE_RESULT=FAIL"
+            exit 1
+          fi
+          echo "PROBE_RESULT=PASS"
